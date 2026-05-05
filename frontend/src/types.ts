@@ -24,7 +24,29 @@ export interface Candle {
   close: number;
 }
 
-export type Timeframe = '1m' | '5m' | '15m' | '1h' | '1D';
+export type Timeframe = '1m' | '5m' | '15m' | '1h' | '1D' | 'TODAY';
+
+export interface TodayPoint {
+  time: number;
+  value: number;
+}
+
+export interface TodayStats {
+  dayOpen: number;
+  dayHigh: number;
+  dayLow: number;
+  dayChange: number;
+  dayChangePct: number;
+  currentValue: number;
+  baseExposure: number;
+  positionCount: number;
+  dataPoints: number;
+}
+
+export interface TodayData {
+  series: TodayPoint[];
+  stats: TodayStats | null;
+}
 
 export interface Snapshot {
   positions: Position[];

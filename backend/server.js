@@ -178,5 +178,95 @@ app.post('/api/reset-base', async (_req, res) => {
   }
 });
 
+// ── Today's historical index ──────────────────────────────────────────────────
+app.get('/api/today', async (_req, res) => {
+  if (!accessToken) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const all = await kite.getPositions();
+    const fno = (all.net || []).filter(
+      (p) => (p.exchange === 'NFO' || p.exchange === 'BFO') && p.quantity !== 0
+    );
+    if (!fno.length) return res.json({ series: [], stats: null });
+
+    // Today's range in IST (server assumed IST)
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    const fromDate = `${todayStr} 09:15:00`;
+    const toDate   = `${todayStr} 15:30:00`;
+
+    // Fetch minute candles for each instrument sequentially (Kite: 3 req/s)
+    const histMap = new Map(); // instrument_token -> Map<epochMs, candle>
+    for (const pos of fno) {
+      try {
+        const raw = await kite.getHistoricalData(pos.instrument_token, 'minute', fromDate, toDate);
+        const m = new Map();
+        for (const c of raw) m.set(new Date(c.date).getTime(), c);
+        histMap.set(pos.instrument_token, m);
+      } catch {
+        histMap.set(pos.instrument_token, new Map());
+      }
+      await new Promise((r) => setTimeout(r, 350)); // ~2.8 req/s
+    }
+
+    // Base exposure: |qty| × avg_entry_price
+    const baseExposure = fno.reduce((s, p) => s + Math.abs(p.quantity) * p.average_price, 0);
+    if (baseExposure === 0) return res.json({ series: [], stats: null });
+
+    // Each instrument's 9:15 open price — used as the day-base for index calc
+    const openPrice = new Map();
+    for (const pos of fno) {
+      const m = histMap.get(pos.instrument_token);
+      const firstCandle = m && m.size > 0 ? [...m.values()][0] : null;
+      openPrice.set(pos.instrument_token, firstCandle ? firstCandle.open : pos.average_price);
+    }
+
+    // Union of all timestamps in sorted order
+    const allTimes = new Set();
+    for (const m of histMap.values()) for (const t of m.keys()) allTimes.add(t);
+    const sortedTimes = Array.from(allTimes).sort((a, b) => a - b);
+
+    // Carry-forward latest close per instrument
+    const latestClose = new Map();
+    for (const pos of fno) latestClose.set(pos.instrument_token, openPrice.get(pos.instrument_token));
+
+    // Build index time-series
+    let dayHigh = 100, dayLow = 100;
+    const series = sortedTimes.map((t) => {
+      for (const pos of fno) {
+        const candle = histMap.get(pos.instrument_token)?.get(t);
+        if (candle) latestClose.set(pos.instrument_token, candle.close);
+      }
+      // index(t) = 100 + Σ[qty × (price(t) − open(9:15))] / baseExposure × 100
+      const pnlFromOpen = fno.reduce((s, pos) => {
+        const curr = latestClose.get(pos.instrument_token) ?? openPrice.get(pos.instrument_token);
+        return s + pos.quantity * (curr - openPrice.get(pos.instrument_token));
+      }, 0);
+      const value = 100 + (pnlFromOpen / baseExposure) * 100;
+      dayHigh = Math.max(dayHigh, value);
+      dayLow  = Math.min(dayLow, value);
+      return { time: t, value };
+    });
+
+    const current = series.length ? series[series.length - 1].value : 100;
+    res.json({
+      series,
+      stats: {
+        dayOpen: 100,
+        dayHigh,
+        dayLow,
+        dayChange: current - 100,
+        dayChangePct: current - 100,
+        currentValue: current,
+        baseExposure,
+        positionCount: fno.length,
+        dataPoints: series.length,
+      },
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
