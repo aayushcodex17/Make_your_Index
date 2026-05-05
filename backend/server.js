@@ -9,21 +9,27 @@ app.use(express.json());
 
 const kite = new KiteConnect({ api_key: process.env.KITE_API_KEY });
 
-// In-memory store
+// ── State ─────────────────────────────────────────────────────────────────────
 let accessToken = null;
-let basePortfolioValue = null;
-let indexHistory = [];
+let basePnl = null;        // total P&L at the time base was locked
+let baseExposure = null;   // total exposure at the time base was locked
 
-// ── Auth ────────────────────────────────────────────────────────────────────
+// Candle store per timeframe
+const TF = {
+  '1m':  { ms: 60_000,       max: 400 },
+  '5m':  { ms: 300_000,      max: 400 },
+  '15m': { ms: 900_000,      max: 400 },
+  '1h':  { ms: 3_600_000,    max: 400 },
+  '1D':  { ms: 86_400_000,   max: 400 },
+};
+const candles = { '1m': [], '5m': [], '15m': [], '1h': [], '1D': [] };
 
-app.get('/api/login-url', (_req, res) => {
-  res.json({ url: kite.getLoginURL() });
-});
+// ── Auth ──────────────────────────────────────────────────────────────────────
+app.get('/api/login-url', (_req, res) => res.json({ url: kite.getLoginURL() }));
 
 app.post('/api/auth', async (req, res) => {
   try {
-    const { requestToken } = req.body;
-    const session = await kite.generateSession(requestToken, process.env.KITE_API_SECRET);
+    const session = await kite.generateSession(req.body.requestToken, process.env.KITE_API_SECRET);
     accessToken = session.access_token;
     kite.setAccessToken(accessToken);
     res.json({ success: true });
@@ -32,80 +38,144 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-// Allow manual token injection (for dev / persistent sessions)
 app.post('/api/set-token', (req, res) => {
-  const { token } = req.body;
-  accessToken = token;
-  kite.setAccessToken(token);
+  accessToken = req.body.token;
+  kite.setAccessToken(req.body.token);
   res.json({ success: true });
 });
 
-// ── Index logic ──────────────────────────────────────────────────────────────
+app.get('/api/status', (_req, res) => res.json({ authenticated: !!accessToken }));
 
-function calcIndexSnapshot(holdings) {
-  const totalCost = holdings.reduce((s, h) => s + h.average_price * h.quantity, 0);
-  const currentValue = holdings.reduce((s, h) => s + h.last_price * h.quantity, 0);
+// ── Instrument parser ─────────────────────────────────────────────────────────
+function parseInstrument(symbol) {
+  if (symbol.endsWith('FUT')) {
+    const body = symbol.slice(0, -3);
+    const expiryMatch = body.match(/\d{2}[A-Z]{3}/);
+    const expiry = expiryMatch ? expiryMatch[0] : '';
+    return { underlying: body.replace(expiry, ''), expiry, type: 'FUT', strike: null };
+  }
+  const optType = symbol.endsWith('CE') ? 'CE' : symbol.endsWith('PE') ? 'PE' : null;
+  if (optType) {
+    const body = symbol.slice(0, -2);
+    const expiryMatch = body.match(/\d{2}[A-Z]{3}/);
+    const expiry = expiryMatch ? expiryMatch[0] : '';
+    const idx = body.indexOf(expiry);
+    const underlying = body.slice(0, idx);
+    const strike = parseFloat(body.slice(idx + expiry.length)) || null;
+    return { underlying, expiry, type: optType, strike };
+  }
+  return { underlying: symbol, expiry: '', type: 'UNKNOWN', strike: null };
+}
 
-  const positions = holdings.map((h) => {
-    const cost = h.average_price * h.quantity;
-    const value = h.last_price * h.quantity;
+// ── Candle aggregation ────────────────────────────────────────────────────────
+function pushCandle(indexValue) {
+  const now = Date.now();
+  for (const [tf, { ms, max }] of Object.entries(TF)) {
+    const bucket = Math.floor(now / ms) * ms;
+    const arr = candles[tf];
+    const last = arr[arr.length - 1];
+    if (last && last.time === bucket) {
+      last.high = Math.max(last.high, indexValue);
+      last.low = Math.min(last.low, indexValue);
+      last.close = indexValue;
+    } else {
+      arr.push({ time: bucket, open: indexValue, high: indexValue, low: indexValue, close: indexValue });
+      if (arr.length > max) arr.shift();
+    }
+  }
+}
+
+// ── Index calculation ─────────────────────────────────────────────────────────
+function calcIndex(fnoPositions) {
+  // exposure = |qty| × avg_entry_price  (actual capital deployed / premium paid)
+  const totalExposure = fnoPositions.reduce(
+    (s, p) => s + Math.abs(p.quantity) * p.average_price, 0
+  );
+
+  // Kite gives us realised + unrealised pnl directly in the position object
+  const totalPnl = fnoPositions.reduce((s, p) => s + p.pnl, 0);
+
+  const positions = fnoPositions.map((p) => {
+    const exposure = Math.abs(p.quantity) * p.average_price;
+    const { underlying, expiry, type, strike } = parseInstrument(p.tradingsymbol);
     return {
-      symbol: h.tradingsymbol,
-      exchange: h.exchange,
-      quantity: h.quantity,
-      avgPrice: h.average_price,
-      lastPrice: h.last_price,
-      exposure: cost,
-      currentValue: value,
-      weight: totalCost > 0 ? (cost / totalCost) * 100 : 0,
-      pnl: value - cost,
-      pnlPct: h.average_price > 0 ? ((h.last_price - h.average_price) / h.average_price) * 100 : 0,
+      symbol: p.tradingsymbol,
+      underlying,
+      expiry,
+      instrumentType: type,
+      strike,
+      exchange: p.exchange,
+      product: p.product,
+      quantity: p.quantity,
+      avgPrice: p.average_price,
+      lastPrice: p.last_price,
+      exposure,
+      weight: totalExposure > 0 ? (exposure / totalExposure) * 100 : 0,
+      pnl: p.pnl,
+      pnlPct: p.average_price > 0 ? (p.pnl / exposure) * 100 : 0,
+      side: p.quantity > 0 ? 'LONG' : 'SHORT',
     };
   });
 
-  return { positions, totalCost, currentValue };
+  return { positions, totalExposure, totalPnl };
 }
 
+// ── Snapshot endpoint ─────────────────────────────────────────────────────────
 app.get('/api/snapshot', async (_req, res) => {
   if (!accessToken) return res.status(401).json({ error: 'Not authenticated' });
-
   try {
-    const holdings = await kite.getHoldings();
+    const all = await kite.getPositions();
 
-    if (!holdings.length) return res.json({ positions: [], indexValue: 100, indexHistory });
+    // Net positions in F&O segment with active quantity
+    const fno = (all.net || []).filter(
+      (p) => (p.exchange === 'NFO' || p.exchange === 'BFO') && p.quantity !== 0
+    );
 
-    const { positions, totalCost, currentValue } = calcIndexSnapshot(holdings);
+    if (!fno.length) {
+      return res.json({
+        positions: [], indexValue: 100, totalExposure: 0, totalPnl: 0,
+        basePnl: basePnl ?? 0, baseExposure: baseExposure ?? 0,
+        candles,
+      });
+    }
+
+    const { positions, totalExposure, totalPnl } = calcIndex(fno);
 
     // Lock base on first call
-    if (basePortfolioValue === null) basePortfolioValue = currentValue;
+    if (basePnl === null) {
+      basePnl = totalPnl;
+      baseExposure = totalExposure;
+    }
 
-    const indexValue = (currentValue / basePortfolioValue) * 100;
+    // Index = 100 + Δ(pnl) / base_exposure × 100
+    const indexValue = baseExposure > 0
+      ? 100 + ((totalPnl - basePnl) / baseExposure) * 100
+      : 100;
 
-    indexHistory.push({ time: new Date().toISOString(), value: indexValue });
-    if (indexHistory.length > 2000) indexHistory.shift();
+    pushCandle(indexValue);
 
-    res.json({ positions, indexValue, totalCost, currentValue, indexHistory });
+    res.json({ positions, indexValue, totalExposure, totalPnl, basePnl, baseExposure, candles });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Reset index base to current portfolio value → index resets to 100
+// ── Reset base ────────────────────────────────────────────────────────────────
 app.post('/api/reset-base', async (_req, res) => {
   if (!accessToken) return res.status(401).json({ error: 'Not authenticated' });
   try {
-    const holdings = await kite.getHoldings();
-    const currentValue = holdings.reduce((s, h) => s + h.last_price * h.quantity, 0);
-    basePortfolioValue = currentValue;
-    indexHistory = [{ time: new Date().toISOString(), value: 100 }];
+    const all = await kite.getPositions();
+    const fno = (all.net || []).filter(
+      (p) => (p.exchange === 'NFO' || p.exchange === 'BFO') && p.quantity !== 0
+    );
+    basePnl = fno.reduce((s, p) => s + p.pnl, 0);
+    baseExposure = fno.reduce((s, p) => s + Math.abs(p.quantity) * p.average_price, 0);
+    for (const tf of Object.keys(candles)) candles[tf] = [];
+    pushCandle(100);
     res.json({ success: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-
-app.get('/api/status', (_req, res) => {
-  res.json({ authenticated: !!accessToken });
 });
 
 const PORT = process.env.PORT || 3001;
