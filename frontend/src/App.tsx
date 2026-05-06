@@ -123,6 +123,12 @@ export default function App() {
             )}
           </div>
 
+          {data?.baseSetAt && (
+            <span style={{ fontSize: 11, color: '#334155', borderLeft: '1px solid #1e2230', paddingLeft: 16 }}>
+              Base since {new Date(data.baseSetAt).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })}{' '}
+              {new Date(data.baseSetAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          )}
           <button onClick={manualRefresh} style={iconBtn}>↻ Refresh</button>
           <button onClick={resetBase} disabled={resetting} style={{ ...iconBtn, color: '#f59e0b' }}>
             {resetting ? 'Resetting…' : '⟳ Reset Base'}

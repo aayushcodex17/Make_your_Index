@@ -55,5 +55,6 @@ export interface Snapshot {
   totalPnl: number;
   basePnl: number;
   baseExposure: number;
+  baseSetAt: number | null;   // epoch ms when base was locked
   candles: Record<Timeframe, Candle[]>;
 }
