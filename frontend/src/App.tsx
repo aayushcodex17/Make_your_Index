@@ -1,49 +1,77 @@
 import { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
-import { Snapshot, Timeframe } from './types';
+import { Snapshot } from './types';
 import AuthPanel from './components/AuthPanel';
 import IndexChart from './components/IndexChart';
 import PositionsTable from './components/PositionsTable';
 
-const POLL_MS = 5_000; // 5s — positions can change any time
-
 const EMPTY_CANDLES = { '1m': [], '5m': [], '15m': [], '1h': [], '1D': [] };
 
 export default function App() {
-  const [auth, setAuth] = useState(false);
-  const [data, setData] = useState<Snapshot | null>(null);
-  const [error, setError] = useState('');
+  const [auth, setAuth]               = useState(false);
+  const [data, setData]               = useState<Snapshot | null>(null);
+  const [error, setError]             = useState('');
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [resetting, setResetting] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [connected, setConnected]     = useState(false);
+  const [resetting, setResetting]     = useState(false);
+  const esRef = useRef<EventSource | null>(null);
 
+  // Check auth on load
   useEffect(() => {
     axios.get('/api/status').then(({ data }) => setAuth(data.authenticated));
   }, []);
 
-  async function fetchSnapshot() {
+  // Open SSE stream once authenticated
+  useEffect(() => {
+    if (!auth) return;
+
+    function openStream() {
+      if (esRef.current) esRef.current.close();
+
+      const es = new EventSource('/api/stream');
+      esRef.current = es;
+
+      es.onopen = () => {
+        setConnected(true);
+        setError('');
+      };
+
+      es.onmessage = (e) => {
+        try {
+          const snap = JSON.parse(e.data) as Snapshot;
+          setData(snap);
+          setLastUpdated(new Date());
+          setConnected(true);
+          setError('');
+        } catch {}
+      };
+
+      es.onerror = () => {
+        setConnected(false);
+        setError('Stream disconnected — reconnecting…');
+        // Browser auto-reconnects EventSource; clear error once it does
+      };
+    }
+
+    openStream();
+    return () => { esRef.current?.close(); esRef.current = null; };
+  }, [auth]);
+
+  async function manualRefresh() {
     try {
       const { data: snap } = await axios.get<Snapshot>('/api/snapshot');
       setData(snap);
       setLastUpdated(new Date());
       setError('');
     } catch (e: any) {
-      setError(e.response?.data?.error || 'Failed to fetch data');
+      setError(e.response?.data?.error || 'Refresh failed');
     }
   }
-
-  useEffect(() => {
-    if (!auth) return;
-    fetchSnapshot();
-    timerRef.current = setInterval(fetchSnapshot, POLL_MS);
-    return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [auth]);
 
   async function resetBase() {
     setResetting(true);
     try {
       await axios.post('/api/reset-base');
-      await fetchSnapshot();
     } finally {
       setResetting(false);
     }
@@ -51,13 +79,14 @@ export default function App() {
 
   if (!auth) return <AuthPanel onAuthenticated={() => setAuth(true)} />;
 
-  const idx = data?.indexValue ?? 100;
-  const diff = idx - 100;
-  const isUp = diff >= 0;
+  const idx      = data?.indexValue ?? 100;
+  const diff     = idx - 100;
+  const isUp     = diff >= 0;
   const totalPnl = data?.totalPnl ?? 0;
 
   return (
     <div style={{ minHeight: '100vh', background: '#0d0f14', paddingBottom: 48 }}>
+
       {/* Header */}
       <header style={{
         background: '#151820', borderBottom: '1px solid #262c3d',
@@ -73,13 +102,28 @@ export default function App() {
             background: 'rgba(99,102,241,0.15)', color: '#818cf8', borderRadius: 4,
           }}>F&O · NFO</span>
         </div>
+
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-          {lastUpdated && (
-            <span style={{ color: '#334155', fontSize: 12 }}>
-              {lastUpdated.toLocaleTimeString()} · 5s refresh
+          {/* Live indicator */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: connected ? '#22c55e' : '#ef4444',
+              boxShadow: connected ? '0 0 0 2px rgba(34,197,94,0.3)' : 'none',
+              animation: connected ? 'pulse 2s infinite' : 'none',
+              display: 'inline-block',
+            }} />
+            <span style={{ fontSize: 12, color: connected ? '#22c55e' : '#ef4444' }}>
+              {connected ? 'Live' : 'Disconnected'}
             </span>
-          )}
-          <button onClick={fetchSnapshot} style={iconBtn}>↻ Refresh</button>
+            {lastUpdated && connected && (
+              <span style={{ fontSize: 11, color: '#334155' }}>
+                · {lastUpdated.toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+
+          <button onClick={manualRefresh} style={iconBtn}>↻ Refresh</button>
           <button onClick={resetBase} disabled={resetting} style={{ ...iconBtn, color: '#f59e0b' }}>
             {resetting ? 'Resetting…' : '⟳ Reset Base'}
           </button>
@@ -97,31 +141,26 @@ export default function App() {
 
         {/* Stats */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 14, marginBottom: 22 }}>
-          <StatCard
-            label="Index Value" large
+          <StatCard label="Index Value" large
             value={idx.toFixed(2)}
             sub={`${isUp ? '+' : ''}${diff.toFixed(2)} pts`}
             color={isUp ? '#22c55e' : '#ef4444'}
           />
-          <StatCard
-            label="Total Return"
+          <StatCard label="Total Return"
             value={`${isUp ? '+' : ''}${((diff / 100) * 100).toFixed(2)}%`}
             sub="vs. base (100)"
             color={isUp ? '#22c55e' : '#ef4444'}
           />
-          <StatCard
-            label="Total P&L"
+          <StatCard label="Total P&L"
             value={`${totalPnl >= 0 ? '+' : ''}₹${fmt(Math.abs(totalPnl))}`}
             sub={data ? `on ₹${fmt(data.baseExposure)} base` : ''}
             color={totalPnl >= 0 ? '#22c55e' : '#ef4444'}
           />
-          <StatCard
-            label="Total Exposure"
+          <StatCard label="Total Exposure"
             value={data ? `₹${fmt(data.totalExposure)}` : '—'}
             sub="current open positions"
           />
-          <StatCard
-            label="Positions"
+          <StatCard label="Positions"
             value={data?.positions.length.toString() ?? '0'}
             sub="active F&O legs"
           />
